@@ -1,0 +1,197 @@
+import os
+import shutil
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision import models, transforms
+from torchvision.datasets import ImageFolder
+from PIL import Image
+import numpy as np
+from torch.cuda.amp import GradScaler, autocast
+
+# Define transforms for the training data and testing data
+data_transforms = {
+    'train': transforms.Compose([
+        transforms.RandomResizedCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(30),
+        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.4),
+        transforms.RandomVerticalFlip(),
+        transforms.RandomAffine(degrees=30, translate=(0.2, 0.2), shear=0.2),
+        transforms.RandomGrayscale(p=0.2),
+        transforms.RandomPerspective(distortion_scale=0.5, p=0.5),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ]),
+    'val': transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ]),
+}
+
+# Function to create train and validation directories
+def prepare_data(data_dir, train_dir, val_dir, val_split=0.2):
+    if not os.path.exists(data_dir):
+        raise FileNotFoundError(f"Data directory does not exist: {data_dir}")
+
+    if not os.path.exists(train_dir):
+        os.makedirs(train_dir)
+    if not os.path.exists(val_dir):
+        os.makedirs(val_dir)
+
+    for class_name in ['Benign', 'Malignant']:
+        class_dir = os.path.join(data_dir, class_name)
+
+        if not os.path.exists(class_dir):
+            print(f"Class directory does not exist: {class_dir}")
+            continue
+
+        images = os.listdir(class_dir)
+        np.random.shuffle(images)  # Shuffle images before splitting
+        num_val = int(len(images) * val_split)
+        val_images = images[:num_val]
+        train_images = images[num_val:]
+
+        class_train_dir = os.path.join(train_dir, class_name)
+        class_val_dir = os.path.join(val_dir, class_name)
+
+        if not os.path.exists(class_train_dir):
+            os.makedirs(class_train_dir)
+        if not os.path.exists(class_val_dir):
+            os.makedirs(class_val_dir)
+
+        for image in train_images:
+            shutil.copy(os.path.join(class_dir, image), os.path.join(class_train_dir, image))
+        for image in val_images:
+            shutil.copy(os.path.join(class_dir, image), os.path.join(class_val_dir, image))
+
+# Define directories
+data_dir = 'E:/ML/datathon/Problem 3/MergedDirectory'
+train_dir = os.path.join(data_dir, 'train')
+val_dir = os.path.join(data_dir, 'val')
+
+# Prepare the data if needed
+prepare_data(data_dir, train_dir, val_dir)
+
+# Load the dataset
+image_datasets = {
+    'train': ImageFolder(train_dir, transform=data_transforms['train']),
+    'val': ImageFolder(val_dir, transform=data_transforms['val']),
+}
+dataloaders = {
+    'train': DataLoader(image_datasets['train'], batch_size=16, shuffle=True, num_workers=4),
+    'val': DataLoader(image_datasets['val'], batch_size=16, shuffle=False, num_workers=4)
+}
+dataset_sizes = {x: len(image_datasets[x]) for x in ['train', 'val']}
+class_names = image_datasets['train'].classes
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+# Load a pre-trained ResNet-152 model
+model_ft = models.resnet152(pretrained=True)
+
+# Replace the final fully connected layer for binary classification
+num_ftrs = model_ft.fc.in_features
+model_ft.fc = nn.Sequential(
+    nn.Dropout(0.5),
+    nn.Linear(num_ftrs, len(class_names))
+)
+
+model_ft = model_ft.to(device)
+
+# Use different learning rates for different layers
+optimizer_ft = optim.SGD([
+    {'params': model_ft.layer4.parameters(), 'lr': 1e-3},
+    {'params': model_ft.fc.parameters(), 'lr': 1e-2}
+], momentum=0.9, weight_decay=1e-4)
+
+# Use a more advanced learning rate scheduler
+exp_lr_scheduler = optim.lr_scheduler.OneCycleLR(optimizer_ft, max_lr=1e-2, epochs=1000, steps_per_epoch=len(dataloaders['train']))
+
+criterion = nn.CrossEntropyLoss()
+
+# Mixed precision training
+scaler = GradScaler()
+
+# Train the model
+def train_model(model, criterion, optimizer, scheduler, num_epochs=25):
+    best_model_wts = model.state_dict()
+    best_acc = 0.0
+
+    for epoch in range(num_epochs):
+        print(f'Epoch {epoch}/{num_epochs - 1}')
+        print('-' * 10)
+
+        for phase in ['train', 'val']:
+            if phase == 'train':
+                model.train()  # Set model to training mode
+            else:
+                model.eval()   # Set model to evaluate mode
+
+            running_loss = 0.0
+            running_corrects = 0
+
+            for inputs, labels in dataloaders[phase]:
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+
+                optimizer.zero_grad()
+
+                with torch.set_grad_enabled(phase == 'train'):
+                    with autocast():
+                        outputs = model(inputs)
+                        _, preds = torch.max(outputs, 1)
+                        loss = criterion(outputs, labels)
+
+                    if phase == 'train':
+                        scaler.scale(loss).backward()
+                        scaler.step(optimizer)
+                        scaler.update()
+
+                running_loss += loss.item() * inputs.size(0)
+                running_corrects += torch.sum(preds == labels.data)
+
+            if phase == 'train':
+                scheduler.step()
+
+            epoch_loss = running_loss / dataset_sizes[phase]
+            epoch_acc = running_corrects.double() / dataset_sizes[phase]
+
+            print(f'{phase} Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}')
+
+            if phase == 'val' and epoch_acc > best_acc:
+                best_acc = epoch_acc
+                best_model_wts = model.state_dict()
+
+        print()
+
+    print(f'Best val Acc: {best_acc:.4f}')
+    model.load_state_dict(best_model_wts)
+    return model
+
+num_epochs = 1000
+model_ft = train_model(model_ft, criterion, optimizer_ft, exp_lr_scheduler, num_epochs=num_epochs)
+
+# Save the trained model
+torch.save(model_ft.state_dict(), 'E:/ML/datathon/Problem 3/MergedDirectory/model_ft.pth')
+
+# Prediction function
+def predict_image(image_path, model, class_names):
+    model.eval()
+    transform = data_transforms['val']
+
+    image = Image.open(image_path).convert('RGB')
+    image = transform(image).unsqueeze(0)
+
+    image = image.to(device)
+    outputs = model(image)
+    _, preds = torch.max(outputs, 1)
+    return class_names[preds[0]]
+
+# Example usage of prediction function
+image_path = 'E:/ML/datathon/Problem 3/MergedDirectory/Benign/1.jpg'  # Change this to your test image path
+predicted_class = predict_image(image_path, model_ft, class_names)
+print(f'The predicted class is: {predicted_class}')
