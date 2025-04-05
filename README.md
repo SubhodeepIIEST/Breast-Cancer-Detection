@@ -1,0 +1,1 @@
+The model is created to check xray of breast cancer and find whether it is malignant or benign and it has achieved accuracy upto 97% using Resnet152 with 2000 Epochs the Dataset was available in the github directory of the Datathon 2024 Contest.
